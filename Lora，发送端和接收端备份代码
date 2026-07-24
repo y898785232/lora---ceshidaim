@@ -1,0 +1,262 @@
+发送端代码
+#include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <WiFiManager.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <SoftwareSerial.h>
+#include <ArduinoJson.h>
+
+#define ONE_WIRE_BUS    D5
+#define LORA_RX         D2
+#define LORA_TX         D1
+#define LORA_M0         D7
+#define LORA_M1         D6
+
+SoftwareSerial LoRaSerial(LORA_RX, LORA_TX);
+
+const char* mqtt_server = "b7fea2bf.ala.asia-southeast1.emqxsl.com";
+const uint16_t mqtt_port = 8883;
+const char* mqtt_user = "eps8266nn";
+const char* mqtt_pass = "yu155414";
+
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(secureClient);
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+String deviceId;
+String topicCmd;
+String topicStatus;
+
+const unsigned long SAMPLE_INTERVAL = 60000UL;
+unsigned long lastSample = 0;
+unsigned long convStart = 0;
+bool convPending = false;
+
+float latestTemp = 0.0;
+bool sensorOk = false;
+
+void setLoRaMode() {
+  digitalWrite(LORA_M0, LOW);
+  digitalWrite(LORA_M1, LOW);
+  delay(100);
+}
+
+void publishStatus(bool online) {
+  if (!mqttClient.connected()) return;
+
+  StaticJsonDocument<192> doc;
+  doc["online"] = online;
+  doc["sensor_ok"] = sensorOk;
+  doc["unit"] = "°C";
+  
+  if (sensorOk) {
+    doc["temperature"] = latestTemp;
+  } else {
+    doc["temperature"] = nullptr;
+  }
+
+  char payload[256];
+  serializeJson(doc, payload);
+  mqttClient.publish(topicStatus.c_str(), payload, true);
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String command = String((char*)payload).substring(0, length);
+  if (command == "STATUS") {
+    sendLoRaData();
+    publishStatus(true);
+  }
+}
+
+void sendLoRaData() {
+  StaticJsonDocument<128> doc;
+  doc["id"] = deviceId;
+  doc["ok"] = sensorOk;
+  doc["ts"] = millis() / 1000;
+
+  if (sensorOk) {
+    doc["temp"] = latestTemp;
+  } else {
+    doc["temp"] = nullptr;
+  }
+
+  char json[160];
+  serializeJson(doc, json);
+  LoRaSerial.println(json);
+  Serial.printf("→ LoRa 发送: %s\n", json);
+}
+
+void finishConversion() {
+  convPending = false;
+  latestTemp = sensors.getTempCByIndex(0);
+  
+  sensorOk = (latestTemp > -55.0 && latestTemp < 125.0 && !isnan(latestTemp));
+
+  if (sensorOk) {
+    Serial.printf("温度: %.2f °C\n", latestTemp);
+  } else {
+    Serial.println("DS18B20 读取失败");
+  }
+
+  sendLoRaData();
+  if (mqttClient.connected()) publishStatus(true);
+}
+
+void setup() {
+  Serial.begin(115200);
+  LoRaSerial.begin(9600);           // ← 已改为 9600
+
+  pinMode(LORA_M0, OUTPUT);
+  pinMode(LORA_M1, OUTPUT);
+  setLoRaMode();
+
+  deviceId = "door_" + String(ESP.getChipId(), HEX);
+  topicCmd = "door/" + deviceId + "/cmd";
+  topicStatus = "door/" + deviceId + "/status";
+
+  Serial.println("Device ID: " + deviceId);
+
+  WiFiManager wifiManager;
+  wifiManager.autoConnect("TEMP_SENSOR");
+
+  secureClient.setInsecure();
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(256);
+
+  sensors.begin();
+  sensors.setResolution(12);
+  sensors.setWaitForConversion(false);
+
+  sensors.requestTemperatures();
+  convStart = millis();
+  lastSample = millis();
+
+  Serial.println("发送端启动完成！");
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqttClient.connected()) {
+      mqttClient.connect(deviceId.c_str(), mqtt_user, mqtt_pass);
+    }
+    mqttClient.loop();
+  }
+
+  unsigned long now = millis();
+
+  if (convPending && now - convStart >= 900) {
+    finishConversion();
+  }
+
+  if (!convPending && now - lastSample >= SAMPLE_INTERVAL) {
+    lastSample = now;
+    sensors.requestTemperatures();
+    convStart = millis();
+    convPending = true;
+  }
+
+  if (LoRaSerial.available()) {
+    String cmd = LoRaSerial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.indexOf("STATUS") != -1) {
+      sendLoRaData();
+    }
+  }
+
+  delay(10);
+}
+接收端代码，接收端代码，
+#include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <WiFiManager.h>
+#include <SoftwareSerial.h>
+#include <ArduinoJson.h>
+
+#define LORA_RX   D2
+#define LORA_TX   D1
+#define LORA_M0   D7
+#define LORA_M1   D6
+
+SoftwareSerial LoRaSerial(LORA_RX, LORA_TX);
+
+const char* mqtt_server = "b7fea2bf.ala.asia-southeast1.emqxsl.com";
+const uint16_t mqtt_port = 8883;
+const char* mqtt_user = "eps8266nn";
+const char* mqtt_pass = "yu155414";
+
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(secureClient);
+
+String gatewayId;
+
+void setLoRaMode() {
+  digitalWrite(LORA_M0, LOW);
+  digitalWrite(LORA_M1, LOW);
+  delay(100);
+}
+
+void setup() {
+  Serial.begin(115200);
+  LoRaSerial.begin(9600);          // ← 已改为 9600（最常用）
+
+  pinMode(LORA_M0, OUTPUT);
+  pinMode(LORA_M1, OUTPUT);
+  setLoRaMode();
+
+  gatewayId = "door_gateway_" + String(ESP.getChipId(), HEX);
+
+  Serial.println("LoRa 接收网关启动 → " + gatewayId);
+
+  WiFiManager wm;
+  wm.autoConnect("LORA_GATEWAY");
+
+  secureClient.setInsecure();
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setBufferSize(256);
+
+  Serial.println("系统就绪，等待 LoRa 数据...");
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqttClient.connected()) {
+      mqttClient.connect(gatewayId.c_str(), mqtt_user, mqtt_pass);
+    }
+    mqttClient.loop();
+  }
+
+  // 接收 LoRa 数据并转发
+  if (LoRaSerial.available()) {
+    String data = LoRaSerial.readStringUntil('\n');
+    data.trim();
+    if (data.length() > 20) {
+      Serial.println("收到 LoRa: " + data);
+      forwardToMQTT(data);
+    }
+  }
+
+  // 每15秒主动请求一次数据
+  static unsigned long lastAsk = 0;
+  if (millis() - lastAsk > 15000) {
+    LoRaSerial.println("STATUS");
+    lastAsk = millis();
+  }
+
+  delay(10);
+}
+
+// ====================== 转发到 MQTT ======================
+void forwardToMQTT(String jsonStr) {
+  if (mqttClient.connected()) {
+    // 使用发送端的真实 Device ID，让网页直接可用
+    String topic = "door/door_772ef9/status";     // ←←← 请改成你发送端的实际ID
+    
+    mqttClient.publish(topic.c_str(), jsonStr.c_str(), true);
+    Serial.println("已转发到 MQTT → 网页可显示");
+  }
+}
